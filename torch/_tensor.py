@@ -158,7 +158,7 @@ class Tensor(torch._C.TensorBase):
                     not torch._C._has_storage(self)
                     and self.device.type == torch._C._get_privateuse1_backend_name()
                 )
-                or (type(self) is not Tensor and self.data_ptr() == 0)
+                or (type(self) is not Tensor and not torch._C._has_storage_data(self))
             ):
                 new_tensor = self.clone()
                 if type(new_tensor) is not type(self):
@@ -459,7 +459,7 @@ class Tensor(torch._C.TensorBase):
                 isinstance(self, torch._subclasses.functional_tensor.FunctionalTensor)
                 or (
                     not torch._subclasses.fake_tensor.is_fake_tensor(self)
-                    and self.data_ptr() == 0
+                    and not torch._C._has_storage_data(self)
                 )
             )
         ):

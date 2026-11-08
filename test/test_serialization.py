@@ -24,6 +24,7 @@ import zipfile
 from collections import namedtuple, OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from unittest.mock import patch
 
@@ -5410,6 +5411,17 @@ class TestEmptySubclass(torch.Tensor):
     ...
 
 
+class TestRealStorageDispatchSubclass(torch.Tensor):
+    @staticmethod
+    def __new__(cls, elem):
+        return torch.Tensor._make_subclass(cls, elem)
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        with torch._C._DisableTorchDispatch():
+            return func(*args, **(kwargs or {}))
+
+
 class TestSubclassSerialization(TestCase):
     def test_tensor_subclass_wrapper_serialization(self):
         wrapped_tensor = torch.rand(2)
@@ -5491,6 +5503,41 @@ class TestSubclassSerialization(TestCase):
             f.seek(0)
             with safe_globals([TestEmptySubclass]):
                 tensor2 = torch.load(f)
+
+    @parametrize("roundtrip", ["deepcopy", "torch_save", "pickle", "forking_pickler"])
+    def test_wrapper_subclass_with_storage_offset_roundtrip(self, roundtrip):
+        a, b = torch.arange(12.0), torch.arange(12.0) + 100
+        t = TwoTensor(a[4:8], b[4:8])
+        self.assertNotEqual(t.data_ptr(), 0)
+        if roundtrip == "deepcopy":
+            new = deepcopy(t)
+        elif roundtrip == "torch_save":
+            with BytesIOContext() as f:
+                torch.save(t, f)
+                f.seek(0)
+                with safe_globals([TwoTensor]):
+                    new = torch.load(f)
+        elif roundtrip == "pickle":
+            new = pickle.loads(pickle.dumps(t))
+        else:
+            new = ForkingPickler.loads(ForkingPickler.dumps(t))
+        self.assertIs(type(new), TwoTensor)
+        self.assertEqual(new.a, t.a)
+        self.assertEqual(new.b, t.b)
+
+    def test_empty_view_of_real_storage_subclass_keeps_storage(self):
+        base = torch.arange(8.0)
+        t = TestRealStorageDispatchSubclass(base[2:2])
+        self.assertEqual(t.data_ptr(), 0)
+        with BytesIOContext() as f:
+            torch.save(t, f)
+            f.seek(0)
+            with safe_globals([TestRealStorageDispatchSubclass]):
+                loaded = torch.load(f)
+        self.assertIs(type(loaded), TestRealStorageDispatchSubclass)
+        self.assertTrue(torch._C._has_storage_data(loaded))
+        self.assertEqual(loaded.storage_offset(), 2)
+        self.assertEqual(loaded.untyped_storage().nbytes(), base.untyped_storage().nbytes())
 
     @skipIfTorchDynamo("name 'SYNTHETIC_LOCAL' is not defined")
     def test_safe_globals_for_weights_only(self):
