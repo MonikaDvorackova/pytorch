@@ -9,11 +9,11 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Literal, TYPE_CHECKING
+from typing import Any, cast, ClassVar, Literal, TYPE_CHECKING, TypeAlias
 
 import torch
 import torch.distributed as dist
-from torch.distributed.checkpoint import CheckpointableTensor
+from torch.distributed.checkpoint.protocol import CheckpointableTensor
 
 
 if TYPE_CHECKING:
@@ -83,10 +83,11 @@ def set_global_layout(tensor: torch.Tensor, layout: GlobalLayout) -> None:
     passed to ``flex_shard()`` that are local shards of an outer (e.g. TP/EP)
     sharding must declare their layout this way.
     """
-    tensor.global_shape = layout.global_shape
-    tensor.global_offsets = layout.global_offsets
-    tensor.local_offsets = layout.local_offsets
-    tensor.local_sizes = layout.local_sizes
+    checkpointable = cast(CheckpointableTensor, tensor)
+    checkpointable.global_shape = layout.global_shape
+    checkpointable.global_offsets = layout.global_offsets
+    checkpointable.local_offsets = layout.local_offsets
+    checkpointable.local_sizes = layout.local_sizes
 
 
 _PARTIAL_GRAD_GROUP_ATTR = "_flex_shard_partial_grad_group"
@@ -147,7 +148,8 @@ def compose_global_layouts(outer: GlobalLayout, inner: GlobalLayout) -> GlobalLa
     )
 
 
-GradientReduceOp = Literal[dist.ReduceOp.AVG, dist.ReduceOp.SUM]
+# "avg", "sum", or dist.ReduceOp.AVG or SUM
+GradientReduceOp: TypeAlias = Literal["avg", "sum"] | dist.ReduceOp.RedOpType
 
 
 @dataclass(frozen=True)
@@ -158,10 +160,18 @@ class GradientReduction:
     summed over its mesh and, with ``op=AVG``, divided by ``divide_factor``,
     which defaults to the mesh size. The placement owns how: its collectives,
     op choice and divisions.
+
+    With ``replicate_size`` > 1 (HSDP), the sum also spans that many replicas
+    of the mesh: the placement reduce-scatters over its mesh and the runtime
+    then all-reduces over the replicas; the default divide factor is the
+    product of the two sizes. ``force_sum`` makes the collectives sum and
+    divide separately, as FSDP2's ``set_force_sum_reduction_for_comms``.
     """
 
     op: GradientReduceOp = dist.ReduceOp.AVG
     divide_factor: float | None = None
+    replicate_size: int = 1
+    force_sum: bool = False
 
     def __post_init__(self) -> None:
         if self.divide_factor is None:
@@ -453,6 +463,9 @@ class PlacementReduceGradResult:
 
     sharded_grads: list[torch.Tensor]
     buffers: list[torch.Tensor] = field(default_factory=list)
+    # The flat reduced shard that ``sharded_grads`` view, for a runtime step
+    # after the reduce-scatter (the HSDP all-reduce), if the placement has one.
+    flat_output: torch.Tensor | None = None
 
 
 __all__ = [
